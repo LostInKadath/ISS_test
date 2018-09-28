@@ -1,6 +1,7 @@
 #pragma once
 #include <stdexcept>
 #include "Callback.h"
+#include "Buffer.h"
 
 
 struct IReceiver
@@ -19,88 +20,164 @@ struct Receiver : IReceiver
 	void Receive(const char* data, unsigned int size)
 	{
 		if (callback == nullptr)
-		    throw std::exception("No customer for callback");
+			throw std::runtime_error("No customer for callback");
 
 		for (auto currentPtr = data; currentPtr < data + size; )
 		{
-			// Check if this is new packet:
-			if (type == NONE)
+			switch (type)
+			{
+			case NONE:                // Check if this is new packet:
 			{
 				switch (type = CheckPacket(currentPtr))
 				{
 				case TEXT:
+					startPacketPtr = currentPtr;
 					packetSize = 0;
 					break;
 
 				case BINARY:
 					++currentPtr;
-
-					// Check if we can read packetSize now or shall wait for the next block
-					if (currentPtr + sizeof(BinaryPacketSizeT) <= data + size)
-					{
-						packetSize = *((BinaryPacketSizeT*)currentPtr);
-						currentPtr += sizeof(BinaryPacketSizeT);
-					}
+					startPacketPtr = currentPtr;
+					packetSize = 0;
 					break;
 
 				default:
-					throw std::exception("Unknown type of packet");
-					break;
-				}
-
-				startPacketPtr = currentPtr;
-			}
-
-			// Handle the proper packet
-			switch (type)
-			{
-			case TEXT:
-				if (startPacketPtr + textMarkerSize <= currentPtr && TextIsFinished(currentPtr - textMarkerSize))
-				{
-					callback->TextPacket(startPacketPtr, packetSize - textMarkerSize);
-
-					packetSize = 0;
-					type = NONE;
-				}
-				else
-				{
-					++packetSize;
-					++currentPtr;
+					throw std::logic_error("Unknown type of packet");
 				}
 				break;
+			}
 
-			case BINARY:
-				// We don't know packetSize yet
-				if (packetSize == 0)
+			case TEXT:                // Handling the proper text packet
+			{
+				if (buffer.empty())
 				{
-					// If we cannot read packetSize and have to wait for the next block
-					if (startPacketPtr + sizeof(BinaryPacketSizeT) > data + size)
+					// Data contains the whole packet, we can send it
+					if (startPacketPtr + textMarkerSize <= currentPtr && TextIsFinished(currentPtr - textMarkerSize + 1))
+					{
+						callback->TextPacket(startPacketPtr, packetSize - textMarkerSize + 1);
+
+						currentPtr++;
+						packetSize = 0;
+						type = NONE;
+					}
+					// Text packet is not finished but the current block is over
+					else if (currentPtr >= data + size - 1)
+					{
+						buffer.append(startPacketPtr, packetSize);
 						currentPtr = data + size;
+					}
+					// Continue searching the end of the packet
 					else
 					{
-						packetSize = *((BinaryPacketSizeT*)startPacketPtr);
-						currentPtr = startPacketPtr + sizeof(BinaryPacketSizeT);
-						startPacketPtr = currentPtr;
+						++packetSize;
+						++currentPtr;
 					}
 				}
-
-				// We know packetSize but part of data is in the next block
-				else if (startPacketPtr + packetSize > data + size)
-					currentPtr = data + size;
-
-				// We know packetSize and can send the whole packet
 				else
 				{
-					callback->BinaryPacket(startPacketPtr, packetSize);
+					buffer.append(currentPtr, sizeof(char));
 
-					currentPtr += packetSize - (currentPtr - startPacketPtr);
-					packetSize = 0;
-					type = NONE;
+					// Buffer contains the whole text packet, we can send it
+					if (buffer.size() >= textMarkerSize && TextIsFinished(buffer.data() + buffer.size() - textMarkerSize))
+					{
+						callback->TextPacket(buffer.data(), buffer.size() - textMarkerSize + 1);
+
+						currentPtr++;
+						buffer.shrinkToFit();
+						packetSize = 0;
+						type = NONE;
+					}
+					// Continue searching the end of the packet
+					else
+					{
+						++packetSize;
+						++currentPtr;
+					}
+				}
+				break;
+			}
+
+			case BINARY:              // Handling the proper text packet
+			{
+				if (buffer.empty())
+				{
+					// We don't know size of packet yet
+					if (packetSize == 0)
+					{
+						// Size of packet can be read from data
+						if (currentPtr + sizeof(BinaryPacketSizeT) <= data + size)
+						{
+							packetSize = *((BinaryPacketSizeT*)currentPtr);
+							currentPtr += sizeof(BinaryPacketSizeT);
+						}
+						else     // We memorize this piece of packet and wait for the next block
+						{
+							auto pieceSize = data + size - currentPtr;
+							buffer.append(currentPtr, pieceSize);
+							currentPtr = data + size;
+						}
+					}
+					// Data flow contains the whole binary packet, we can send it
+					else if (currentPtr + packetSize <= data + size)
+					{
+						callback->BinaryPacket(currentPtr, packetSize);
+
+						currentPtr += packetSize;
+						packetSize = 0;
+						type = NONE;
+						buffer.shrinkToFit();
+					}
+					// Binary packet is not finished, but the current block is over
+					else
+					{
+						auto pieceSize = data + size - currentPtr;
+						buffer.append(currentPtr, pieceSize);
+						currentPtr = data + size;
+					}
+				}
+				else        // There's something in the buffer
+				{
+					// We don't know size of packet
+					if (packetSize == 0)
+					{
+						auto pieceSize = sizeof(BinaryPacketSizeT) - buffer.size();
+
+						buffer.append(currentPtr, pieceSize);
+						packetSize = *((BinaryPacketSizeT*)buffer.data());
+
+						buffer.shrinkToFit();
+						currentPtr += pieceSize;
+					}
+					// Buffer contains a part of binary packet
+					else
+					{
+						auto packetLeftSize = packetSize - buffer.size();
+
+						// Binary packet ends within the current block
+						if (currentPtr + packetLeftSize <= data + size)
+						{
+							buffer.append(currentPtr, packetLeftSize);
+							callback->BinaryPacket(buffer.data(), buffer.size());
+
+							currentPtr += packetLeftSize;
+							packetSize = 0;
+							type = NONE;
+							buffer.shrinkToFit();
+						}
+						// Binary packet continues in the next block
+						else
+						{
+							auto pieceSize = data + size - currentPtr;
+							buffer.append(currentPtr, pieceSize);
+							currentPtr = data + size;
+						}
+					}
 				}
 				break;
 
 			default:
 				break;
+			}
 			}
 		}
 	}
@@ -116,6 +193,7 @@ private:
 	unsigned int packetSize = 0;
 	const char *startPacketPtr = nullptr;
 
+	Buffer buffer;
 	ICallback *callback;
 
 
